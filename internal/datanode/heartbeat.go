@@ -9,6 +9,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/thomaszambrano/DFS-Topicos-Telematica/internal/pb"
+	"github.com/thomaszambrano/DFS-Topicos-Telematica/internal/types"
 )
 
 // StartHeartbeat arranca el agente de heartbeat y bloquea hasta que ctx se cancela.
@@ -40,6 +41,8 @@ func (d *DataNode) StartHeartbeat(ctx context.Context, controlAddr string, inter
 			return nil
 		case <-ticker.C:
 			d.beat(ctx, client)
+		case <-d.kick:
+			d.beat(ctx, client)
 		}
 	}
 }
@@ -64,6 +67,7 @@ func (d *DataNode) beat(ctx context.Context, client pb.DataNodeServiceClient) {
 	report := &pb.NodeReport{
 		NodeId:             d.NodeID,
 		AdvertisedEndpoint: d.Endpoint,
+		GrpcEndpoint:       d.GRPCEndpoint,
 		CapacityBytes:      capacity,
 		UsedBytes:          used,
 		ChunkIds:           ids,
@@ -85,19 +89,30 @@ func (d *DataNode) beat(ctx context.Context, client pb.DataNodeServiceClient) {
 	}
 }
 
-// execute atiende una orden recibida en la respuesta al heartbeat.
-//
-// En el Hito 2 la lista llega siempre vacía. El switch existe para que la
-// dirección de la comunicación quede establecida desde ahora y el Hito 3 solo
-// tenga que rellenar los casos.
 func (d *DataNode) execute(cmd *pb.Command) {
+	id := types.ChunkID(cmd.GetChunkId())
 	switch cmd.GetType() {
 	case pb.CommandType_COMMAND_TYPE_DELETE_CHUNK:
-		log.Printf("[%s] orden DELETE %s", d.NodeID, cmd.GetChunkId())
+		if err := d.Store.Delete(id); err != nil {
+			log.Printf("[%s] DELETE %s falló: %v", d.NodeID, id, err)
+			return
+		}
+		log.Printf("[%s] DELETE %s ok", d.NodeID, id)
 	case pb.CommandType_COMMAND_TYPE_COPY_CHUNK:
-		log.Printf("[%s] orden COPY %s -> %s (Hito 3)", d.NodeID, cmd.GetChunkId(), cmd.GetTargetEndpoint())
+		target := cmd.GetTargetEndpoint()
+		go func() {
+			started := time.Now()
+			if err := d.copyChunk(id, target); err != nil {
+				log.Printf("[%s] COPY %s -> %s falló: %v", d.NodeID, id, target, err)
+				return
+			}
+			log.Printf("[%s] COPY %s -> %s ok en %s", d.NodeID, id, target, time.Since(started).Round(time.Millisecond))
+		}()
 	case pb.CommandType_COMMAND_TYPE_REPORT_INVENTORY:
-		log.Printf("[%s] orden REPORT_INVENTORY", d.NodeID)
+		select {
+		case d.kick <- struct{}{}:
+		default:
+		}
 	default:
 		log.Printf("[%s] orden desconocida: %v", d.NodeID, cmd.GetType())
 	}

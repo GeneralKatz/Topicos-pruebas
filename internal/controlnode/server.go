@@ -22,6 +22,7 @@ type Server struct {
 	ns    *Namespace
 	reg   *Registry
 	alloc *Allocator
+	rep   *Replicator
 
 	heartbeatInterval time.Duration
 }
@@ -31,6 +32,10 @@ func NewServer(ns *Namespace, reg *Registry, alloc *Allocator, heartbeatInterval
 	return &Server{ns: ns, reg: reg, alloc: alloc, heartbeatInterval: heartbeatInterval}
 }
 
+func (s *Server) AttachReplicator(rp *Replicator) {
+	s.rep = rp
+}
+
 // Heartbeat atiende el reporte de un DataNode y devuelve sus órdenes (RN-12).
 //
 // Este es el ÚNICO punto de contacto entre el plano de control y el de datos, y lo
@@ -38,9 +43,14 @@ func NewServer(ns *Namespace, reg *Registry, alloc *Allocator, heartbeatInterval
 // llamarlo de vuelta: responde por la misma conexión que el nodo abrió.
 func (s *Server) Heartbeat(ctx context.Context, report *pb.NodeReport) (*pb.CommandList, error) {
 	s.reg.Update(report)
-	// En el Hito 2 no hay órdenes: sin replicación no hay nada que copiar ni borrar.
-	// El campo del ritmo sí se usa, para que el ControlNode pueda ajustarlo en vivo.
-	return &pb.CommandList{HeartbeatIntervalMs: s.heartbeatInterval.Milliseconds()}, nil
+	var commands []*pb.Command
+	if s.rep != nil {
+		commands = s.rep.Drain(types.NodeID(report.GetNodeId()))
+	}
+	return &pb.CommandList{
+		Commands:            commands,
+		HeartbeatIntervalMs: s.heartbeatInterval.Milliseconds(),
+	}, nil
 }
 
 // Routes registra la API REST versionada por prefijo de ruta (RI-06).
@@ -67,6 +77,7 @@ func (s *Server) Routes() http.Handler {
 	// Administración y diagnóstico (RC-13).
 	mux.HandleFunc("GET /v1/nodes", s.handleNodes)
 	mux.HandleFunc("GET /v1/df", s.handleDF)
+	mux.HandleFunc("PUT /v1/config/replication", s.handleSetReplication)
 	mux.HandleFunc("GET /health", s.handleHealth)
 
 	return logging(mux)
@@ -160,7 +171,8 @@ func (s *Server) handleAllocateChunk(w http.ResponseWriter, r *http.Request) {
 }
 
 type commitRequest struct {
-	SHA256 string `json:"sha256"`
+	SHA256    string              `json:"sha256"`
+	Confirmed map[string][]string `json:"confirmed"`
 }
 
 func (s *Server) handleCommit(w http.ResponseWriter, r *http.Request) {
@@ -168,7 +180,17 @@ func (s *Server) handleCommit(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	version, err := s.alloc.Commit(r.PathValue("upload_id"), req.SHA256)
+
+	var confirmed map[types.ChunkID][]types.NodeID
+	if req.Confirmed != nil {
+		confirmed = make(map[types.ChunkID][]types.NodeID, len(req.Confirmed))
+		for chunk, nodes := range req.Confirmed {
+			for _, n := range nodes {
+				confirmed[types.ChunkID(chunk)] = append(confirmed[types.ChunkID(chunk)], types.NodeID(n))
+			}
+		}
+	}
+	version, err := s.alloc.Commit(r.PathValue("upload_id"), req.SHA256, confirmed)
 	if err != nil {
 		fail(w, err)
 		return
@@ -349,6 +371,22 @@ func (s *Server) handleDF(w http.ResponseWriter, r *http.Request) {
 		"chunk_size":         s.alloc.ChunkSize(),
 		"replication_factor": s.alloc.ReplicationFactor(),
 	})
+}
+
+type replicationRequest struct {
+	ReplicationFactor int `json:"replication_factor"`
+}
+
+func (s *Server) handleSetReplication(w http.ResponseWriter, r *http.Request) {
+	var req replicationRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if err := s.alloc.SetReplicationFactor(req.ReplicationFactor); err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"replication_factor": s.alloc.ReplicationFactor()})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

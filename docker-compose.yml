@@ -26,9 +26,13 @@ services:
       # En producción se deja el valor por omisión de 64 MB.
       CHUNK_SIZE: "4194304"
 
-      # R=1: este hito no tiene replicación. Se lee del entorno porque RX-07 exige
-      # que el factor sea configurable y el Hito 3 solo tendrá que cambiar este valor.
-      REPLICATION_FACTOR: "1"
+      # R=3: cada chunk se guarda en tres DataNodes distintos. RX-07 exige que el
+      # factor sea configurable, así que sigue leyéndose del entorno.
+      REPLICATION_FACTOR: "3"
+
+      # W=2: un chunk se da por escrito con 2 confirmaciones (RT-06). El tercero se
+      # completa después, por re-replicación, si no confirmó a tiempo.
+      WRITE_QUORUM: "2"
 
       SUSPECT_AFTER: "9s"
       DEAD_AFTER: "30s"
@@ -55,6 +59,8 @@ services:
       NODE_ID: datanode1
       DATA_DIR: /data
       LISTEN_ADDR: ":8080"
+      GRPC_ADDR: ":9091"
+      GRPC_ENDPOINT: "datanode1:9091"
 
       # ADVERTISED_ENDPOINT es la dirección que el nodo reporta al ControlNode y que
       # el ControlNode entrega a los clientes. Aquí es localhost:8081 —el puerto
@@ -74,11 +80,12 @@ services:
     <<: *datanode
     container_name: dfsha-datanode2
     ports:
-      - "8082:8080"
+      - "8085:8080"
     environment:
       <<: *datanode_env
       NODE_ID: datanode2
-      ADVERTISED_ENDPOINT: "localhost:8082"
+      ADVERTISED_ENDPOINT: "localhost:8085"
+      GRPC_ENDPOINT: "datanode2:9091"
     volumes:
       - dn2-data:/data
 
@@ -91,6 +98,7 @@ services:
       <<: *datanode_env
       NODE_ID: datanode3
       ADVERTISED_ENDPOINT: "localhost:8083"
+      GRPC_ENDPOINT: "datanode3:9091"
     volumes:
       - dn3-data:/data
 
@@ -103,6 +111,7 @@ services:
       <<: *datanode_env
       NODE_ID: datanode4
       ADVERTISED_ENDPOINT: "localhost:8084"
+      GRPC_ENDPOINT: "datanode4:9091"
     volumes:
       - dn4-data:/data
 

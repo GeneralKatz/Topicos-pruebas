@@ -159,3 +159,27 @@ func TestNewStoreRecalculaOcupacion(t *testing.T) {
 		t.Errorf("tras reabrir, Stats = (%d, %d), esperaba (10, 1)", used, count)
 	}
 }
+
+// Reenviar el mismo chunk (el ACK se perdió y el cliente reintenta) sobrescribe sin
+// inflar la ocupación ni el contador: la escritura es idempotente.
+func TestPutRepetidoEsIdempotente(t *testing.T) {
+	s := nuevoStore(t)
+	datos := []byte("12345678")
+
+	for i := 0; i < 3; i++ {
+		if _, _, err := s.Put("repetido", bytes.NewReader(datos), Checksum(datos)); err != nil {
+			t.Fatalf("Put #%d: %v", i, err)
+		}
+	}
+
+	if used, _, count := s.Stats(); used != 8 || count != 1 {
+		t.Errorf("tras 3 Put del mismo chunk, Stats = (%d, %d), esperaba (8, 1)", used, count)
+	}
+	leido, err := s.Get("repetido")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !bytes.Equal(leido, datos) {
+		t.Errorf("Get devolvió %q, esperaba %q", leido, datos)
+	}
+}

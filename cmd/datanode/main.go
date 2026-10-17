@@ -9,14 +9,19 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
+	"google.golang.org/grpc"
+
 	"github.com/thomaszambrano/DFS-Topicos-Telematica/internal/datanode"
+	"github.com/thomaszambrano/DFS-Topicos-Telematica/internal/pb"
 )
 
 // config reúne la configuración del DataNode (B.5.1). Todo se lee del entorno
@@ -31,6 +36,9 @@ type config struct {
 	// interna del contenedor no siempre es alcanzable desde fuera (RD-12).
 	AdvertisedEndpoint string
 
+	GRPCAddr     string
+	GRPCEndpoint string
+
 	ControlAddr       string        // ControlNode al que envía los heartbeats
 	Capacity          int64         // capacidad declarada en bytes
 	HeartbeatInterval time.Duration // cada cuánto reporta
@@ -43,6 +51,8 @@ func loadConfig() (config, error) {
 		ListenAddr:         envOr("LISTEN_ADDR", ":8080"),
 		AdvertisedEndpoint: os.Getenv("ADVERTISED_ENDPOINT"),
 		ControlAddr:        os.Getenv("CONTROL_ADDR"),
+		GRPCAddr:           envOr("GRPC_ADDR", ":9091"),
+		GRPCEndpoint:       os.Getenv("GRPC_ENDPOINT"),
 	}
 
 	if cfg.NodeID == "" {
@@ -55,6 +65,13 @@ func loadConfig() (config, error) {
 	// dirección de escucha. Sirve para correr nativo, no para Docker.
 	if cfg.AdvertisedEndpoint == "" {
 		cfg.AdvertisedEndpoint = cfg.ListenAddr
+	}
+
+	if cfg.GRPCEndpoint == "" {
+		cfg.GRPCEndpoint = cfg.GRPCAddr
+		if strings.HasPrefix(cfg.GRPCEndpoint, ":") {
+			cfg.GRPCEndpoint = "localhost" + cfg.GRPCEndpoint
+		}
 	}
 
 	var err error
@@ -74,9 +91,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("configuración inválida: %v", err)
 	}
-	log.Printf("datanode %s | data=%s | listen=%s | anuncia=%s | control=%s | capacidad=%d MB",
+	log.Printf("datanode %s | data=%s | listen=%s | anuncia=%s | grpc=%s (%s) | control=%s | capacidad=%d MB",
 		cfg.NodeID, cfg.DataDir, cfg.ListenAddr, cfg.AdvertisedEndpoint,
-		cfg.ControlAddr, cfg.Capacity/(1024*1024))
+		cfg.GRPCAddr, cfg.GRPCEndpoint, cfg.ControlAddr, cfg.Capacity/(1024*1024))
 
 	// signal.NotifyContext cancela el contexto al recibir SIGINT o SIGTERM, que
 	// es lo que manda `docker stop`. Todo lo que arranque debe respetar este ctx
@@ -93,6 +110,10 @@ func main() {
 		cfg.NodeID, count, used, capacity)
 
 	node := datanode.New(store, cfg.NodeID, cfg.AdvertisedEndpoint)
+	node.GRPCEndpoint = cfg.GRPCEndpoint
+
+	grpcSrv := grpc.NewServer()
+	pb.RegisterChunkServiceServer(grpcSrv, datanode.NewChunkServer(node))
 
 	srv := &http.Server{
 		Addr:    cfg.ListenAddr,
@@ -112,6 +133,16 @@ func main() {
 		}
 	}()
 	go func() {
+		listener, err := net.Listen("tcp", cfg.GRPCAddr)
+		if err != nil {
+			log.Fatalf("escuchando gRPC en %s: %v", cfg.GRPCAddr, err)
+		}
+		log.Printf("datanode %s gRPC escuchando en %s", cfg.NodeID, cfg.GRPCAddr)
+		if err := grpcSrv.Serve(listener); err != nil {
+			log.Printf("servidor gRPC terminó: %v", err)
+		}
+	}()
+	go func() {
 		if err := node.StartHeartbeat(ctx, cfg.ControlAddr, cfg.HeartbeatInterval); err != nil {
 			log.Printf("heartbeat terminó: %v", err)
 		}
@@ -127,6 +158,7 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("apagado forzado: %v", err)
 	}
+	grpcSrv.Stop()
 }
 
 func envOr(key, def string) string {

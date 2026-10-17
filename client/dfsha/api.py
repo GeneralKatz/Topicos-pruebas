@@ -140,9 +140,17 @@ class ControlClient:
             {"index": index, "size": size, "checksum": checksum},
         )
 
-    def commit(self, upload_id: str, sha256: str) -> dict:
-        """Publica la versión. Es la última operación y es atómica (RT-07)."""
-        return self._json("POST", f"/v1/obj/{urllib.parse.quote(upload_id)}/commit", {"sha256": sha256})
+    def commit(self, upload_id: str, sha256: str, confirmed: dict[str, list[str]] | None = None) -> dict:
+        """Publica la versión. Es la última operación y es atómica (RT-07).
+
+        `confirmed` mapea cada chunk_id a los node_id que confirmaron (ACK) haberlo
+        guardado. El ControlNode registra como réplicas solo esos nodos y exige el
+        quórum de escritura por chunk (RT-06). Si se omite, asume todos los asignados.
+        """
+        body: dict[str, Any] = {"sha256": sha256}
+        if confirmed is not None:
+            body["confirmed"] = confirmed
+        return self._json("POST", f"/v1/obj/{urllib.parse.quote(upload_id)}/commit", body)
 
     def abort(self, upload_id: str) -> dict:
         """Cancela la carga y libera el lease (RT-09)."""
@@ -187,8 +195,16 @@ class DataClient:
     archivo, y solo conoce direcciones que le entregó el manifiesto.
     """
 
+    # Velocidad mínima que se asume al escribir un chunk. Sirve para acotar el timeout:
+    # un chunk de 4 MB no necesita esperar 120 s a un nodo que no responde, mientras que
+    # uno de 64 MB por un enlace lento sí necesita tiempo. Es un tope, no una promesa.
+    MIN_WRITE_RATE = 256 * 1024  # bytes por segundo
+
     def __init__(self, timeout: float = 120.0):
         self.timeout = timeout
+
+    def _write_timeout(self, size: int) -> float:
+        return min(self.timeout, max(10.0, size / self.MIN_WRITE_RATE))
 
     @staticmethod
     def _url(endpoint: str, chunk_id: str) -> str:
@@ -196,8 +212,12 @@ class DataClient:
             endpoint = f"http://{endpoint}"
         return f"{endpoint.rstrip('/')}/chunk/{urllib.parse.quote(chunk_id)}"
 
-    def put_chunk(self, endpoint: str, chunk_id: str, data: bytes, checksum: str) -> dict:
+    def put_chunk(self, endpoint: str, chunk_id: str, data: bytes, checksum: str, attempts: int = 4) -> dict:
         """Sube un chunk declarando su checksum.
+
+        Reintentar es seguro: el DataNode sobrescribe con los mismos bytes si el chunk ya
+        llegó y solo se perdió el ACK. `attempts` lo baja el cliente cuando hay otras
+        réplicas que alcanzan el quórum, para no esperar de más a un nodo caído.
 
         El DataNode verifica el hash antes de aceptarlo, así un chunk corrupto en
         tránsito nunca llega a disco (RD-02).
@@ -207,10 +227,20 @@ class DataClient:
             "X-Chunk-Checksum": checksum,
             "Content-Length": str(len(data)),
         }
-        _, _, body = _request("PUT", self._url(endpoint, chunk_id), body=data, headers=headers, timeout=self.timeout)
+        _, _, body = _request(
+            "PUT", self._url(endpoint, chunk_id), body=data, headers=headers,
+            timeout=self._write_timeout(len(data)), attempts=attempts,
+        )
         return json.loads(body) if body else {}
 
-    def get_chunk(self, endpoint: str, chunk_id: str) -> tuple[bytes, str]:
-        """Descarga un chunk y devuelve sus bytes junto al checksum que reportó el nodo."""
-        _, headers, body = _request("GET", self._url(endpoint, chunk_id), timeout=self.timeout)
+    def get_chunk(self, endpoint: str, chunk_id: str, attempts: int = 4) -> tuple[bytes, str]:
+        """Descarga un chunk y devuelve sus bytes junto al checksum que reportó el nodo.
+
+        `attempts` es cuántas veces se intenta contra ESTE nodo antes de rendirse. El
+        failover entre réplicas lo pasa en 1: si el nodo no responde, es más barato
+        probar la siguiente réplica que esperar el retroceso exponencial (RQ-26).
+        """
+        _, headers, body = _request(
+            "GET", self._url(endpoint, chunk_id), timeout=self.timeout, attempts=attempts
+        )
         return body, headers.get("X-Chunk-Checksum", "")

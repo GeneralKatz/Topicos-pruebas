@@ -145,6 +145,15 @@ func (s *Store) Put(id types.ChunkID, r io.Reader, expected string) (int64, stri
 		return 0, "", fmt.Errorf("cerrando temporal: %w", err)
 	}
 
+	// Si el chunk ya existía (el cliente reintentó porque se perdió el ACK, o llega una
+	// copia de re-replicación) se sobrescribe con los mismos bytes, y esa escritura NO
+	// debe contarse como un chunk nuevo: de lo contrario la ocupación que se reporta al
+	// ControlNode se infla con cada reintento y distorsiona la colocación.
+	previous := int64(-1)
+	if info, err := os.Stat(s.chunkPath(id)); err == nil {
+		previous = info.Size()
+	}
+
 	if err := os.WriteFile(s.sumPath(id), []byte(sum), 0o644); err != nil {
 		return 0, "", fmt.Errorf("escribiendo checksum: %w", err)
 	}
@@ -155,8 +164,12 @@ func (s *Store) Put(id types.ChunkID, r io.Reader, expected string) (int64, stri
 	syncDir(s.baseDir)
 
 	s.mu.Lock()
-	s.used += n
-	s.count++
+	if previous >= 0 {
+		s.used += n - previous // sobrescritura: solo cambia la diferencia de tamaño
+	} else {
+		s.used += n
+		s.count++
+	}
 	s.mu.Unlock()
 
 	return n, sum, nil

@@ -303,3 +303,26 @@ func (ns *Namespace) Rename(from, to string) error {
 	node.ModifiedAt = now
 	return nil
 }
+
+func (ns *Namespace) CurrentChunks() []types.ChunkID {
+	ns.mu.RLock()
+	defer ns.mu.RUnlock()
+
+	var out []types.ChunkID
+	var walk func(n *types.Inode)
+	walk = func(n *types.Inode) {
+		if n.IsDir() {
+			for _, child := range n.Children {
+				walk(child)
+			}
+			return
+		}
+		if n.Current != nil {
+			for _, c := range n.Current.Chunks {
+				out = append(out, c.ID)
+			}
+		}
+	}
+	walk(ns.root)
+	return out
+}

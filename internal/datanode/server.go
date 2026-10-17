@@ -17,14 +17,18 @@ type DataNode struct {
 	NodeID   string
 	Endpoint string // endpoint anunciable (RD-12)
 
+	GRPCEndpoint string
+
 	// inFlight cuenta las transferencias en curso. Viaja en el heartbeat para que
 	// el ControlNode pondere la carga al elegir destinos (RD-10).
 	inFlight atomic.Int64
+
+	kick chan struct{}
 }
 
 // New construye el servicio del DataNode sobre un almacén ya abierto.
 func New(store *Store, nodeID, endpoint string) *DataNode {
-	return &DataNode{Store: store, NodeID: nodeID, Endpoint: endpoint}
+	return &DataNode{Store: store, NodeID: nodeID, Endpoint: endpoint, kick: make(chan struct{}, 1)}
 }
 
 // Routes registra las rutas de la API del DataNode.

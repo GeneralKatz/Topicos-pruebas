@@ -38,6 +38,11 @@ type config struct {
 	// del entorno desde ahora porque RX-07 exige que sea configurable.
 	ReplicationFactor int
 
+	// WriteQuorum es W: cuántas confirmaciones necesita un chunk para darlo por
+	// escrito (RT-06). El valor base es 2. Se acota por los destinos asignados, así
+	// que con R=1 sigue bastando una.
+	WriteQuorum int
+
 	// Umbrales de clasificación de membresía (RN-13). El estado intermedio
 	// SOSPECHOSO evita que un nodo que reinicia rápido dispare re-replicación.
 	SuspectAfter time.Duration
@@ -69,6 +74,12 @@ func loadConfig() (config, error) {
 	if cfg.ReplicationFactor < 1 {
 		return cfg, fmt.Errorf("REPLICATION_FACTOR debe ser >= 1, recibí %d", cfg.ReplicationFactor)
 	}
+	if cfg.WriteQuorum, err = envInt("WRITE_QUORUM", 2); err != nil {
+		return cfg, err
+	}
+	if cfg.WriteQuorum < 1 {
+		return cfg, fmt.Errorf("WRITE_QUORUM debe ser >= 1, recibí %d", cfg.WriteQuorum)
+	}
 	if cfg.SuspectAfter, err = envDuration("SUSPECT_AFTER", 9*time.Second); err != nil {
 		return cfg, err
 	}
@@ -91,8 +102,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("configuración inválida: %v", err)
 	}
-	log.Printf("controlnode | http=%s | grpc=%s | chunk=%d MB | R=%d",
-		cfg.HTTPAddr, cfg.GRPCAddr, cfg.ChunkSize/(1024*1024), cfg.ReplicationFactor)
+	log.Printf("controlnode | http=%s | grpc=%s | chunk=%d MB | R=%d | W=%d",
+		cfg.HTTPAddr, cfg.GRPCAddr, cfg.ChunkSize/(1024*1024), cfg.ReplicationFactor, cfg.WriteQuorum)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -101,8 +112,12 @@ func main() {
 	namespace := controlnode.NewNamespace()
 	placer := controlnode.NewPlacer(registry)
 	allocator := controlnode.NewAllocator(namespace, placer, registry,
-		cfg.ChunkSize, cfg.ReplicationFactor, cfg.LeaseTTL)
+		cfg.ChunkSize, cfg.ReplicationFactor, cfg.WriteQuorum, cfg.LeaseTTL)
 	server := controlnode.NewServer(namespace, registry, allocator, cfg.HeartbeatInterval)
+
+	replicator := controlnode.NewReplicator(namespace, registry, allocator)
+	server.AttachReplicator(replicator)
+	go replicator.Run(ctx)
 
 	httpSrv := &http.Server{
 		Addr:              cfg.HTTPAddr,

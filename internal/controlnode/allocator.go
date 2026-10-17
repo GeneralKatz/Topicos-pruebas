@@ -94,6 +94,7 @@ type Allocator struct {
 
 	chunkSize int64
 	r         int
+	w         int // quórum de escritura: confirmaciones mínimas por chunk (RT-06)
 	leaseTTL  time.Duration
 
 	uploads map[string]*Upload
@@ -107,18 +108,30 @@ type Allocator struct {
 }
 
 // NewAllocator construye el gestor de cargas.
-func NewAllocator(ns *Namespace, placer *Placer, reg *Registry, chunkSize int64, r int, leaseTTL time.Duration) *Allocator {
+func NewAllocator(ns *Namespace, placer *Placer, reg *Registry, chunkSize int64, r, w int, leaseTTL time.Duration) *Allocator {
 	return &Allocator{
 		ns:          ns,
 		placer:      placer,
 		reg:         reg,
 		chunkSize:   chunkSize,
 		r:           r,
+		w:           w,
 		leaseTTL:    leaseTTL,
 		uploads:     make(map[string]*Upload),
 		leases:      make(map[string]lease),
 		idempotency: make(map[string]string),
 	}
+}
+
+func (a *Allocator) checkWritable() error {
+	if a.r < 2 {
+		return nil
+	}
+	if alive := len(a.reg.Alive()); alive < 2 {
+		return fmt.Errorf("%w: hay %d DataNode disponible y con R=%d se exigen al menos 2 para aceptar escrituras nuevas",
+			ErrNoNodes, alive, a.r)
+	}
+	return nil
 }
 
 // randomID genera un identificador opaco de 16 bytes en hexadecimal.
@@ -147,6 +160,10 @@ func (a *Allocator) OpenUpload(path, owner string, size int64, idempotencyKey st
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	if err := a.checkWritable(); err != nil {
+		return nil, err
+	}
 
 	// Reintento de una petición ya atendida: se devuelve la misma carga en lugar de
 	// abrir otra (RT-08).
@@ -215,6 +232,10 @@ func (a *Allocator) AllocateChunk(uploadID string, index uint32, size int64, che
 
 	up, err := a.liveUpload(uploadID)
 	if err != nil {
+		return nil, err
+	}
+
+	if err := a.checkWritable(); err != nil {
 		return nil, err
 	}
 
@@ -289,7 +310,7 @@ func (a *Allocator) endpointOf(id types.NodeID) string {
 // del namespace, así que no existe ningún instante en el que se pueda observar una
 // versión a medias (RQ-10). Si el cliente muere antes de llegar aquí, el objeto
 // anterior permanece intacto y los chunks escritos quedan huérfanos (RT-09).
-func (a *Allocator) Commit(uploadID, sha256 string) (*types.Version, error) {
+func (a *Allocator) Commit(uploadID, sha256 string, confirmed map[types.ChunkID][]types.NodeID) (*types.Version, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -324,6 +345,26 @@ func (a *Allocator) Commit(uploadID, sha256 string) (*types.Version, error) {
 		return nil, fmt.Errorf("%w: los chunks suman %d bytes, se declararon %d", ErrIncomplete, total, up.Size)
 	}
 
+	// Quórum de escritura (RT-06): cada chunk debe tener al menos W confirmaciones, y
+	// las réplicas que se registran son las que CONFIRMARON, no todas las asignadas.
+	// Los chunks que quedan con menos de R copias son los que el replicador deberá
+	// completar en segundo plano.
+	underReplicated := 0
+	for i, c := range ordered {
+		replicas, err := a.confirmedReplicas(c, confirmed)
+		if err != nil {
+			return nil, err
+		}
+		ordered[i].Replicas = replicas
+		if len(replicas) < a.r {
+			underReplicated++
+		}
+	}
+	if underReplicated > 0 {
+		log.Printf("COMMIT %s | %d chunks con menos de R=%d réplicas confirmadas (re-replicación pendiente)",
+			up.Path, underReplicated, a.r)
+	}
+
 	version := &types.Version{
 		ID:        up.VersionID,
 		Size:      total,
@@ -336,8 +377,8 @@ func (a *Allocator) Commit(uploadID, sha256 string) (*types.Version, error) {
 		return nil, err
 	}
 
-	// El cliente llegó al commit, así que declaró haber escrito todos los chunks en
-	// los destinos asignados. Se informan al registro para que una lectura inmediata
+	// El cliente declaró en qué nodos confirmó cada chunk (o, si no informó nada, se
+	// asumen los asignados). Se informan al registro para que una lectura inmediata
 	// después de esta escritura encuentre las ubicaciones, sin esperar el próximo
 	// heartbeat (RQ-09). Son suposiciones con caducidad: el inventario de cada nodo
 	// las confirma o las desmiente en segundos.
@@ -351,6 +392,51 @@ func (a *Allocator) Commit(uploadID, sha256 string) (*types.Version, error) {
 	log.Printf("COMMIT %s | version=%s | %d chunks | %d bytes | sha256=%s",
 		up.Path, version.ID, len(ordered), total, sha256)
 	return version, nil
+}
+
+// confirmedReplicas decide en qué nodos se registra un chunk como replicado.
+//
+// Si el cliente no informó confirmaciones (confirmed == nil, como el cliente del
+// Hito 2) se conserva el comportamiento anterior: todos los destinos asignados. Si las
+// informó, solo cuentan los nodos que además fueron asignados a ESE chunk —un cliente
+// no puede declarar réplicas en nodos que el ControlNode no eligió (RT-03)— y el chunk
+// debe alcanzar el quórum W. El quórum exigido se acota por los destinos asignados:
+// con R=1 hay un solo destino y basta con su confirmación.
+func (a *Allocator) confirmedReplicas(c types.ChunkMeta, confirmed map[types.ChunkID][]types.NodeID) ([]types.NodeID, error) {
+	if confirmed == nil {
+		return c.Replicas, nil
+	}
+
+	assigned := make(map[types.NodeID]struct{}, len(c.Replicas))
+	for _, id := range c.Replicas {
+		assigned[id] = struct{}{}
+	}
+
+	seen := make(map[types.NodeID]struct{}, len(c.Replicas))
+	var out []types.NodeID
+	for _, id := range confirmed[c.ID] {
+		if _, ok := assigned[id]; !ok {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+
+	need := a.w
+	if need > len(c.Replicas) {
+		need = len(c.Replicas)
+	}
+	if need < 1 {
+		need = 1
+	}
+	if len(out) < need {
+		return nil, fmt.Errorf("%w: el chunk %d (%s) tiene %d confirmaciones y el quórum de escritura exige %d",
+			ErrIncomplete, c.Index, c.ID, len(out), need)
+	}
+	return out, nil
 }
 
 // Abort cancela una carga, libera el lease y devuelve los chunks a recolectar.
@@ -439,4 +525,19 @@ func (a *Allocator) Manifest(path string) (*Manifest, error) {
 func (a *Allocator) ChunkSize() int64 { return a.chunkSize }
 
 // ReplicationFactor expone el factor de replicación configurado.
-func (a *Allocator) ReplicationFactor() int { return a.r }
+func (a *Allocator) ReplicationFactor() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.r
+}
+
+func (a *Allocator) SetReplicationFactor(n int) error {
+	if n < 1 || n > 64 {
+		return fmt.Errorf("%w: el factor de replicación debe estar entre 1 y 64, recibí %d", ErrBadRequest, n)
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	log.Printf("REPLICACIÓN | R cambia de %d a %d en caliente", a.r, n)
+	a.r = n
+	return nil
+}

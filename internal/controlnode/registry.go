@@ -23,15 +23,16 @@ const (
 // NodeState es la vista que el ControlNode tiene de un DataNode.
 // Todo su contenido proviene de los heartbeats: es estado blando completo.
 type NodeState struct {
-	ID       types.NodeID `json:"node_id"`
-	Endpoint string       `json:"endpoint"`
-	Capacity int64        `json:"capacity"`
-	Used     int64        `json:"used"`
-	InFlight int64        `json:"in_flight"`
-	Chunks   int          `json:"chunks"`
-	Draining bool         `json:"draining"`
-	LastSeen time.Time    `json:"last_seen"`
-	Status   NodeStatus   `json:"status"`
+	ID           types.NodeID `json:"node_id"`
+	Endpoint     string       `json:"endpoint"`
+	GRPCEndpoint string       `json:"grpc_endpoint"`
+	Capacity     int64        `json:"capacity"`
+	Used         int64        `json:"used"`
+	InFlight     int64        `json:"in_flight"`
+	Chunks       int          `json:"chunks"`
+	Draining     bool         `json:"draining"`
+	LastSeen     time.Time    `json:"last_seen"`
+	Status       NodeStatus   `json:"status"`
 
 	// inventory es el conjunto de chunks que este nodo reportó en su último
 	// heartbeat. Se guarda para poder retirar sus ubicaciones antiguas cuando
@@ -143,6 +144,7 @@ func (r *Registry) Update(report *pb.NodeReport) {
 	}
 
 	node.Endpoint = report.GetAdvertisedEndpoint()
+	node.GRPCEndpoint = report.GetGrpcEndpoint()
 	node.Capacity = report.GetCapacityBytes()
 	node.Used = report.GetUsedBytes()
 	node.InFlight = report.GetInFlight()
@@ -316,4 +318,90 @@ func (r *Registry) Totals() (capacity, used int64, aliveNodes, chunks int) {
 		aliveNodes++
 	}
 	return capacity, used, aliveNodes, len(r.locations)
+}
+
+type ReplicaTask struct {
+	Chunk      types.ChunkID
+	Source     types.NodeID
+	Target     types.NodeID
+	TargetGRPC string
+	Have       int
+}
+
+func (r *Registry) PlanReplication(chunks []types.ChunkID, want int, pending map[types.ChunkID]map[types.NodeID]struct{}) []ReplicaTask {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	now := time.Now()
+
+	type candidate struct {
+		chunk types.ChunkID
+		held  map[types.NodeID]struct{}
+	}
+	var candidates []candidate
+	for _, chunk := range chunks {
+		held := make(map[types.NodeID]struct{}, want)
+		for _, id := range r.holders(chunk, now) {
+			held[id] = struct{}{}
+		}
+		for id := range pending[chunk] {
+			held[id] = struct{}{}
+		}
+		if len(held) < want {
+			candidates = append(candidates, candidate{chunk: chunk, held: held})
+		}
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if len(candidates[i].held) != len(candidates[j].held) {
+			return len(candidates[i].held) < len(candidates[j].held)
+		}
+		return candidates[i].chunk < candidates[j].chunk
+	})
+
+	load := make(map[types.NodeID]int)
+	var tasks []ReplicaTask
+	for _, c := range candidates {
+		var source *NodeState
+		for id := range r.locations[c.chunk] {
+			n, ok := r.nodes[id]
+			if !ok || r.classify(n, now) != StatusAlive {
+				continue
+			}
+			if source == nil || load[id] < load[source.ID] || (load[id] == load[source.ID] && id < source.ID) {
+				source = n
+			}
+		}
+		if source == nil {
+			continue
+		}
+
+		var target *NodeState
+		for id, n := range r.nodes {
+			if _, has := c.held[id]; has {
+				continue
+			}
+			if n.Draining || n.GRPCEndpoint == "" || n.Free() <= 0 || r.classify(n, now) != StatusAlive {
+				continue
+			}
+			if target == nil || load[id] < load[target.ID] ||
+				(load[id] == load[target.ID] && n.Utilization() < target.Utilization()) ||
+				(load[id] == load[target.ID] && n.Utilization() == target.Utilization() && id < target.ID) {
+				target = n
+			}
+		}
+		if target == nil {
+			continue
+		}
+
+		load[source.ID]++
+		load[target.ID]++
+		tasks = append(tasks, ReplicaTask{
+			Chunk:      c.chunk,
+			Source:     source.ID,
+			Target:     target.ID,
+			TargetGRPC: target.GRPCEndpoint,
+			Have:       len(c.held),
+		})
+	}
+	return tasks
 }

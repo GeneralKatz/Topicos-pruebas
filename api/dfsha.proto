@@ -1,8 +1,14 @@
 // Contrato RPC interno de DFSha (RI-02: entre nodos siempre RPC tipado, nunca REST).
 //
-// Enlace que especifica: ControlNode <-> DataNode.
-// Quién inicia: SIEMPRE el DataNode (RN-12, RD-06). El ControlNode nunca abre una
-// conexión hacia un DataNode; las órdenes viajan en la respuesta al heartbeat.
+// Dos enlaces:
+//
+//  1. ControlNode <-> DataNode (DataNodeService). Quién inicia: SIEMPRE el DataNode
+//     (RN-12, RD-06). El ControlNode nunca abre una conexión hacia un DataNode; las
+//     órdenes viajan en la respuesta al heartbeat.
+//
+//  2. DataNode <-> DataNode (ChunkService). Mueve los bytes de un chunk entre nodos,
+//     con flujo (RX-03). Lo inicia el nodo que ENVÍA: el anterior de la cadena de
+//     replicación, o el que ejecuta una orden COPY_CHUNK.
 syntax = "proto3";
 
 package dfsha.v1;
@@ -43,6 +49,12 @@ message NodeReport {
   // En drenado el nodo no acepta escrituras nuevas y no debe elegirse como
   // destino de ninguna asignación (RD-11). En el Hito 2 siempre es false.
   bool draining = 8;
+
+  // Dirección host:puerto del servidor gRPC de este nodo (ChunkService), por la que
+  // OTROS DataNodes le envían chunks. No es advertised_endpoint, que es la dirección
+  // HTTP para clientes: dentro de Docker esta es el nombre del servicio
+  // (datanode2:9091) y no localhost, que solo existe para quien está en el host.
+  string grpc_endpoint = 9;
 }
 
 enum CommandType {
@@ -58,15 +70,62 @@ enum CommandType {
 message Command {
   CommandType type = 1;
   string chunk_id = 2;
-  // Destino para COPY_CHUNK, en la forma host:puerto.
+  // Destino para COPY_CHUNK: el grpc_endpoint (host:puerto) del DataNode que recibirá
+  // el chunk. Es una dirección entre nodos, no la que usan los clientes.
   string target_endpoint = 3;
 }
 
-// CommandList es la respuesta al heartbeat. En el Hito 2 viaja siempre vacía: el
-// campo existe desde ahora para que la dirección de la comunicación quede fijada
-// y el Hito 3 no cambie el contrato.
+// CommandList es la respuesta al heartbeat. En el Hito 2 viajaba siempre vacía; desde
+// el Hito 3 lleva las órdenes pendientes del nodo (copiar, borrar, reportar).
 message CommandList {
   repeated Command commands = 1;
   // Permite al ControlNode ajustar el ritmo de reporte sin reiniciar el DataNode.
   int64 heartbeat_interval_ms = 2;
+}
+
+// ChunkService lo implementa el DataNode y lo llama otro DataNode.
+service ChunkService {
+  // ReplicateChunk transfiere un chunk con flujo: el primer mensaje es la cabecera y
+  // los siguientes llevan los bytes. El receptor verifica el checksum antes de
+  // aceptarlo (RD-02) y lo guarda con la misma escritura atómica de cualquier chunk.
+  //
+  // Se usa para dos cosas con el mismo mecanismo:
+  //  - la replicación en pipeline (RT-05): el receptor reenvía a `downstream` mientras
+  //    escribe, y el ack vuelve por la cadena en sentido inverso.
+  //  - COPY_CHUNK (re-replicación y rebalanceo): `downstream` va vacío.
+  //
+  // Es idempotente: recibir un chunk que ya existe lo sobrescribe con los mismos bytes.
+  rpc ReplicateChunk(stream ReplicateChunkRequest) returns (ReplicateChunkResponse);
+}
+
+message ReplicateChunkRequest {
+  oneof payload {
+    // Siempre el primer mensaje del flujo.
+    ChunkHeader header = 1;
+    // Los siguientes: el contenido, en trozos.
+    bytes data = 2;
+  }
+}
+
+message ChunkHeader {
+  string chunk_id = 1;
+
+  // SHA-256 en hexadecimal (D-003). El receptor lo compara con lo que recibió.
+  string checksum = 2;
+
+  int64 size = 3;
+
+  // Resto de la cadena de replicación: los grpc_endpoint de los nodos que siguen, en
+  // orden. Vacío si este nodo es el último o si es una copia directa. El campo existe
+  // desde ya para que pasar a pipeline no cambie el contrato.
+  repeated string downstream = 4;
+}
+
+message ReplicateChunkResponse {
+  // node_id de los nodos que confirmaron haber guardado el chunk: el receptor más los
+  // de la cadena que le respondieron con éxito. El cliente los entrega al commit.
+  repeated string acked_nodes = 1;
+
+  // Bytes que el receptor guardó.
+  int64 size = 2;
 }
